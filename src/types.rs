@@ -7,10 +7,19 @@ use tokio::sync::{Mutex, broadcast};
 pub enum Error {
     #[error("couldn't serialize json for response")]
     ServerSerialization(#[from] serde_json::Error),
-    #[error("the lobby that you tried to join doesn't exist")]
-    LobbyDoesNotExist,
-    #[error("the player doesn't exist")]
-    PeerDoesNotExist,
+    #[error("the lobby with the id of {id} to join doesn't exist")]
+    LobbyDoesNotExist { id: String },
+    #[error("the player with the id of {id} doesn't exist")]
+    PeerDoesNotExist { id: i64 },
+    #[error(
+        "the player that you tried to relay to isn't in the lobby with the id of {sender_lobby_id}, it's in {dest_lobby_id}"
+    )]
+    LobbiesDoNotMatch {
+        sender_lobby_id: String,
+        dest_lobby_id: String,
+    },
+    #[error("the peer with the id of {peer_id} has no lobby")]
+    NoLobby{peer_id:i64},
     #[error("channel error")]
     ChannelSendError(#[from] broadcast::error::SendError<ResponseType>),
 }
@@ -30,7 +39,7 @@ pub struct Lobby {
 }
 
 impl Lobby {
-    pub fn new(id: String, mesh: bool, peers: Vec<i64>) -> Self{
+    pub fn new(id: String, mesh: bool, peers: Vec<i64>) -> Self {
         let (send, _) = broadcast::channel::<ResponseType>(32);
 
         Lobby {
@@ -76,7 +85,7 @@ pub enum ResponseType {
         dest_id: i64,
         message: RelayMessage,
     },
-    Error (String),
+    Error(String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

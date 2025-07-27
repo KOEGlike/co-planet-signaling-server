@@ -104,9 +104,7 @@ async fn read(
                     error!("error sending error{}", e);
                 }
             }
-            RequestType::Relay { dest_id, message } => {
-                
-            },
+            RequestType::Relay { dest_id, message } => {}
         };
     }
 }
@@ -123,23 +121,74 @@ async fn create_lobby(mesh: bool, state: AppStateWrapped) -> String {
     id
 }
 
+async fn relay_message(
+    sender_id: i64,
+    dest_id: i64,
+    message: RelayMessage,
+    state: AppStateWrapped,
+) -> Result<(), Error> {
+    let state = (*state).lock().await;
 
+    let sender_index = state
+        .peers
+        .iter()
+        .position(|e| e.id == sender_id)
+        .ok_or(Error::PeerDoesNotExist { id: sender_id })?;
+
+    let dest_index = state
+        .peers
+        .iter()
+        .position(|e| e.id == dest_id)
+        .ok_or(Error::PeerDoesNotExist { id: dest_id })?;
+
+    let dest_lobby = state.peers[dest_index]
+        .lobby
+        .as_ref()
+        .map_or_else(|| Err(Error::NoLobby { peer_id: dest_id }), Ok)?;
+
+    let sender_lobby = state.peers[sender_index]
+        .lobby
+        .as_ref()
+        .map_or_else(|| Err(Error::NoLobby { peer_id: sender_id }), Ok)?;
+
+    if dest_lobby != sender_lobby {
+        return Err(Error::LobbiesDoNotMatch {
+            sender_lobby_id: sender_lobby.clone(),
+            dest_lobby_id: dest_lobby.clone(),
+        });
+    }
+
+    let lobby_id = dest_lobby;
+
+    let lobby = state
+        .lobbies
+        .iter()
+        .find(|l| l.id == *lobby_id)
+        .map_or_else(|| Err(Error::LobbyDoesNotExist { id: lobby_id.clone() }), Ok)?;
+
+    lobby.channel.send(ResponseType::Relay { sender_id, dest_id, message }).map_err(Error::ChannelSendError)?;
+
+    Ok(())
+}
 
 async fn join_lobby(peer_id: i64, lobby_id: String, state: AppStateWrapped) -> Result<(), Error> {
     let mut state = (*state).lock().await;
 
     // Find indices first instead of mutable references
-    let lobby_index = state
-        .lobbies
-        .iter()
-        .position(|e| e.id == lobby_id)
-        .ok_or(Error::LobbyDoesNotExist)?;
+    let lobby_index =
+        state
+            .lobbies
+            .iter()
+            .position(|e| e.id == lobby_id)
+            .ok_or(Error::LobbyDoesNotExist {
+                id: lobby_id.clone(),
+            })?;
 
     let peer_index = state
         .peers
         .iter()
         .position(|e| e.id == peer_id)
-        .ok_or(Error::PeerDoesNotExist)?;
+        .ok_or(Error::PeerDoesNotExist { id: peer_id })?;
 
     // Now we can get mutable references one at a time
     let lobby = &mut state.lobbies[lobby_index];
