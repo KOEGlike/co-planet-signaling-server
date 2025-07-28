@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use axum::{
     extract::{
         State,
-        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
     },
     response::Response,
 };
@@ -9,7 +11,10 @@ use futures_util::{
     sink::SinkExt,
     stream::{SplitStream, StreamExt},
 };
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{broadcast, mpsc},
+    time::sleep,
+};
 use tracing::*;
 
 pub mod types;
@@ -19,77 +24,197 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppStateWrappe
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+#[derive(Debug, Clone)]
+enum WSMessagePass {
+    Raw(Message),
+    Typed(ResponseType),
+}
+
+#[tracing::instrument]
 async fn handle_socket(socket: WebSocket, state: AppStateWrapped) {
     let (mut sender, receiver) = socket.split();
 
-    let (tx, mut rx) = mpsc::channel::<ResponseType>(32);
+    let (tx, mut rx) = mpsc::channel::<WSMessagePass>(100);
 
     let peer_id = rand::random_range(2..i64::MAX);
-    (*state).lock().await.peers.push(Peer {
-        id: peer_id,
-        lobby: None,
-    });
+
+    info!("new socket connection, id:{peer_id}");
+
+    state.lock().await.peers.insert(
+        peer_id,
+        Peer {
+            id: peer_id,
+            lobby: None,
+        },
+    );
 
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let json = serde_json::to_string_pretty(&msg);
-            let msg = match json {
-                Ok(json) => json,
-                Err(e) => Error::ServerSerialization(e).to_string(),
+            let mut close = false;
+            let msg = match msg {
+                WSMessagePass::Raw(message) => {
+                    if let Message::Close(_) = message {
+                        close = true
+                    }
+                    message
+                }
+                WSMessagePass::Typed(response_type) => {
+                    let json = serde_json::to_string_pretty(&response_type);
+                    let msg = match json {
+                        Ok(json) => json,
+                        Err(e) => Error::ServerSerialization(e).to_string(),
+                    };
+                    Message::Text(Utf8Bytes::from(msg))
+                }
             };
-            let err = sender.send(Message::Text(Utf8Bytes::from(msg))).await;
+            let err = sender.send(msg).await;
+            if close && let Err(e) = sender.close().await {
+                error!("error closing socket: {e}");
+            }
+
             if let Err(e) = err {
                 error!("{}", e);
             }
         }
     });
 
+    {
+        let tx = tx.clone();
+        let state = state.clone();
+
+        tokio::spawn(async move {
+            read(receiver, tx, peer_id, state).await;
+        });
+    }
+
     tokio::spawn(async move {
-        read(receiver, tx, peer_id, state).await;
+        write(tx, peer_id, state).await;
     });
 }
 
-async fn write(
-    mut sender: mpsc::Sender<ResponseType>,
-    lobby_id: String,
-    mut state: AppStateWrapped,
-) {
-    // let recv=(*state).lock().await.
+async fn write(sender: mpsc::Sender<WSMessagePass>, peer_id: i64, state: AppStateWrapped) {
+    loop {
+        let mut state = state.lock().await;
+        let l = if let Some(p) = state.peers.get(&peer_id).cloned()
+            && let Some(l_id) = p.lobby
+            && let Some(l) = state.lobbies.get_mut(&l_id)
+        {
+            l
+        } else {
+            sleep(Duration::from_millis(500)).await;
+            continue;
+        };
+
+        let mut channel = l.channel.subscribe();
+
+        loop {
+            let msg = channel.recv().await;
+
+            let msg = match msg {
+                Ok(m) => m,
+                Err(broadcast::error::RecvError::Closed) => {
+                    error!("channel closed for lobby {}", l.id);
+                    sleep(Duration::from_millis(500)).await;
+                    break;
+                }
+                Err(broadcast::error::RecvError::Lagged(lag)) => {
+                    warn!("lobby {} lagged {lag} messages", l.id);
+                    continue;
+                }
+            };
+
+            let msg = match msg {
+                ResponseType::ID { .. } => continue,
+                ResponseType::PeerConnect { id } | ResponseType::PeerDisconnect { id } => {
+                    if id != peer_id {
+                        msg
+                    } else {
+                        continue;
+                    }
+                }
+                ResponseType::Relay {
+                    sender_id: _,
+                    dest_id,
+                    message: _,
+                } => {
+                    if dest_id == peer_id {
+                        msg
+                    } else {
+                        continue;
+                    }
+                }
+                ResponseType::Error(_) => continue,
+            };
+
+            if let Err(e) = sender.send(WSMessagePass::Typed(msg)).await {
+                error!("error while sending to message passer thread: {e}");
+            }
+        }
+    }
 }
 
 async fn read(
     mut receiver: SplitStream<WebSocket>,
-    mut sender: mpsc::Sender<ResponseType>,
+    sender: mpsc::Sender<WSMessagePass>,
     peer_id: i64,
-    mut state: AppStateWrapped,
+    state: AppStateWrapped,
 ) {
     while let Some(msg) = receiver.next().await {
+        let span=span!(Level::TRACE, "request");
+        let _enter=span.enter();
+
+        info!("new ws message:{:#?}", msg);
+
         let msg = match msg {
             Ok(msg) => msg,
             Err(e) => {
-                error!("{}", e);
+                error!("error receiving websocket message: {}", e);
                 continue;
             }
         };
 
         let msg = match msg {
             Message::Text(utf8_bytes) => utf8_bytes,
-            Message::Close(_close_frame) => todo!(),
+            Message::Close(_close_frame) => {
+                let mut state = state.lock().await;
+                if let Some(Some(id)) = state.peers.get(&peer_id).map(|p| &p.lobby).cloned()
+                    && let Some(lobby) = state.lobbies.get_mut(&id)
+                    && let Err(e) = lobby
+                        .channel
+                        .send(ResponseType::PeerDisconnect { id: peer_id })
+                {
+                    error!("error sending disconnect message: {e}")
+                }
+                if let Err(e) = sender
+                    .send(WSMessagePass::Raw(Message::Close(Some(CloseFrame {
+                        code: 1000,
+                        reason: Utf8Bytes::from_static("closing based on client request"),
+                    }))))
+                    .await
+                {
+                    error!("error sending closing message to message passer: {e}")
+                }
+
+                break;
+            }
             _ => {
-                warn!("unexpected ws message type received");
                 continue;
             }
         };
+
+        info!("text ws message: {msg}");
 
         let msg = serde_json::from_str::<RequestType>(&msg);
 
         let msg = match msg {
             Ok(msg) => msg,
             Err(e) => {
-                error! {"{}", e};
+                error! {"error deserializing request json {}", e};
                 continue;
             }
         };
+
+        info!("deserialized msg: {:#?}", msg);
 
         match msg {
             RequestType::Join { lobby_id } => {
@@ -98,25 +223,41 @@ async fn read(
                     None => create_lobby(true, state.clone()).await,
                 };
 
-                if let Err(e) = join_lobby(peer_id, lobby_id, state.clone()).await
-                    && let Err(e) = sender.send(ResponseType::Error(e.to_string())).await
+                if let Err(e) = join_lobby(peer_id, lobby_id.clone(), state.clone()).await
+                    && let Err(e) = sender
+                        .send(WSMessagePass::Typed(ResponseType::Error(format!(
+                            "error joining lobby: {e}"
+                        ))))
+                        .await
                 {
-                    error!("error sending error{}", e);
+                    error!("error sending error: {}", e);
+                }
+                
+                info!("joined lobby: {lobby_id}");
+            }
+            RequestType::Relay { dest_id, message } => {
+                if let Err(e) = relay_message(peer_id, dest_id, message, state.clone()).await
+                    && let Err(e) = sender
+                        .send(WSMessagePass::Typed(ResponseType::Error(format!(
+                            "error relaying message: {e}"
+                        ))))
+                        .await
+                {
+                    error!("error relaying message: {}", e);
                 }
             }
-            RequestType::Relay { dest_id, message } => {}
         };
     }
 }
 
 async fn create_lobby(mesh: bool, state: AppStateWrapped) -> String {
-    let mut state = (*state).lock().await;
+    let mut state = state.lock().await;
 
     let id = cuid2::CuidConstructor::new().with_length(8).create_id();
 
     let lobby = Lobby::new(id.clone(), mesh, vec![]);
 
-    state.lobbies.push(lobby);
+    state.lobbies.insert(id.clone(), lobby);
 
     id
 }
@@ -127,71 +268,68 @@ async fn relay_message(
     message: RelayMessage,
     state: AppStateWrapped,
 ) -> Result<(), Error> {
-    let state = (*state).lock().await;
+    let mut state = state.lock().await;
 
-    let sender_index = state
-        .peers
-        .iter()
-        .position(|e| e.id == sender_id)
-        .ok_or(Error::PeerDoesNotExist { id: sender_id })?;
+    let dest_lobby = match state.peers.get(&dest_id) {
+        Some(p) => match &p.lobby {
+            Some(l) => l,
+            None => return Err(Error::NoLobby { peer_id: dest_id }),
+        },
+        None => return Err(Error::PeerDoesNotExist { id: dest_id }),
+    };
 
-    let dest_index = state
-        .peers
-        .iter()
-        .position(|e| e.id == dest_id)
-        .ok_or(Error::PeerDoesNotExist { id: dest_id })?;
+    let sender_lobby = match state.peers.get(&sender_id) {
+        Some(p) => match &p.lobby {
+            Some(l) => l,
+            None => return Err(Error::NoLobby { peer_id: dest_id }),
+        },
+        None => return Err(Error::PeerDoesNotExist { id: dest_id }),
+    };
 
-    let dest_lobby = state.peers[dest_index]
-        .lobby
-        .as_ref()
-        .map_or_else(|| Err(Error::NoLobby { peer_id: dest_id }), Ok)?;
-
-    let sender_lobby = state.peers[sender_index]
-        .lobby
-        .as_ref()
-        .map_or_else(|| Err(Error::NoLobby { peer_id: sender_id }), Ok)?;
-
-    if dest_lobby != sender_lobby {
+    if **dest_lobby != **sender_lobby {
         return Err(Error::LobbiesDoNotMatch {
-            sender_lobby_id: sender_lobby.clone(),
-            dest_lobby_id: dest_lobby.clone(),
+            sender_lobby_id: (*sender_lobby).clone(),
+            dest_lobby_id: (*dest_lobby).clone(),
         });
     }
 
-    let lobby_id = dest_lobby;
+    let lobby_id = dest_lobby.clone();
 
-    let lobby = state
-        .lobbies
-        .iter()
-        .find(|l| l.id == *lobby_id)
-        .map_or_else(|| Err(Error::LobbyDoesNotExist { id: lobby_id.clone() }), Ok)?;
+    let lobby = match state.lobbies.get_mut(&lobby_id) {
+        Some(l) => l,
+        None => {
+            return Err(Error::LobbyDoesNotExist {
+                id: lobby_id.clone(),
+            });
+        }
+    };
 
-    lobby.channel.send(ResponseType::Relay { sender_id, dest_id, message }).map_err(Error::ChannelSendError)?;
+    lobby
+        .channel
+        .send(ResponseType::Relay {
+            sender_id,
+            dest_id,
+            message,
+        })
+        .map_err(Error::ChannelSendError)?;
 
     Ok(())
 }
 
 async fn join_lobby(peer_id: i64, lobby_id: String, state: AppStateWrapped) -> Result<(), Error> {
-    let mut state = (*state).lock().await;
+    let mut state = state.lock().await;
 
-    // Find indices first instead of mutable references
-    let lobby_index =
-        state
-            .lobbies
-            .iter()
-            .position(|e| e.id == lobby_id)
-            .ok_or(Error::LobbyDoesNotExist {
-                id: lobby_id.clone(),
-            })?;
+    let peer = match state.peers.get_mut(&peer_id) {
+        Some(p) => p,
+        None => return Err(Error::PeerDoesNotExist { id: peer_id }),
+    };
+    peer.lobby = Some(lobby_id.clone());
 
-    let peer_index = state
-        .peers
-        .iter()
-        .position(|e| e.id == peer_id)
-        .ok_or(Error::PeerDoesNotExist { id: peer_id })?;
+    let lobby = match state.lobbies.get_mut(&lobby_id) {
+        Some(l) => l,
+        None => return Err(Error::LobbyDoesNotExist { id: lobby_id }),
+    };
 
-    // Now we can get mutable references one at a time
-    let lobby = &mut state.lobbies[lobby_index];
     lobby.peers.push(peer_id);
 
     lobby
@@ -208,7 +346,5 @@ async fn join_lobby(peer_id: i64, lobby_id: String, state: AppStateWrapped) -> R
         })
         .map_err(Error::ChannelSendError)?;
 
-    let peer = &mut state.peers[peer_index];
-    peer.lobby = Some(lobby_id.clone());
     Ok(())
 }

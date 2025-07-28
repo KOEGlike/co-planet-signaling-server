@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{collections::HashMap, hash::Hash, sync::Arc};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
 
@@ -38,9 +38,28 @@ pub struct Lobby {
     pub channel: broadcast::Sender<ResponseType>,
 }
 
+impl Hash for Lobby {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.mesh.hash(state);
+        self.peers.hash(state);
+    }
+}
+
+impl PartialEq for Lobby {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Lobby {
+    
+}
+
+
 impl Lobby {
     pub fn new(id: String, mesh: bool, peers: Vec<i64>) -> Self {
-        let (send, _) = broadcast::channel::<ResponseType>(32);
+        let (send, _) = broadcast::channel::<ResponseType>(100);
 
         Lobby {
             id,
@@ -51,10 +70,10 @@ impl Lobby {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 pub struct AppState {
-    pub lobbies: Vec<Lobby>,
-    pub peers: Vec<Peer>,
+    pub lobbies: HashMap<String,Lobby>,
+    pub peers: HashMap<i64,Peer>,
 }
 
 pub type AppStateWrapped = Arc<Mutex<AppState>>;
