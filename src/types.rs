@@ -5,7 +5,7 @@ use tokio::sync::{Mutex, broadcast};
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("couldn't serialize json for response")]
+    #[error("couldn't serialize json for response: {0}")]
     ServerSerialization(#[from] serde_json::Error),
     #[error("the lobby with the id of {id} to join doesn't exist")]
     LobbyDoesNotExist { id: String },
@@ -20,7 +20,7 @@ pub enum Error {
     },
     #[error("the peer with the id of {peer_id} has no lobby")]
     NoLobby{peer_id:i64},
-    #[error("channel error")]
+    #[error("channel error: {0}")]
     ChannelSendError(#[from] broadcast::error::SendError<ResponseType>),
 }
 
@@ -104,7 +104,7 @@ pub enum ResponseType {
         dest_id: i64,
         message: RelayMessage,
     },
-    Error(String),
+    Error{error:String},
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

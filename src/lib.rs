@@ -15,7 +15,7 @@ use tokio::{
     sync::{broadcast, mpsc},
     time::sleep,
 };
-use tracing::*;
+use tracing::{field::ValueSet, *};
 
 pub mod types;
 pub use types::*;
@@ -48,12 +48,18 @@ async fn handle_socket(socket: WebSocket, state: AppStateWrapped) {
         },
     );
 
+    info!("inserted peer");
+
     tokio::spawn(async move {
+        let span = span!(Level::TRACE, "message passer");
+        let _enter = span.enter();
+        info!("entered message passer task");
         while let Some(msg) = rx.recv().await {
             let mut close = false;
             let msg = match msg {
                 WSMessagePass::Raw(message) => {
                     if let Message::Close(_) = message {
+                        info!("closing socket");
                         close = true
                     }
                     message
@@ -67,15 +73,21 @@ async fn handle_socket(socket: WebSocket, state: AppStateWrapped) {
                     Message::Text(Utf8Bytes::from(msg))
                 }
             };
+
             let err = sender.send(msg).await;
-            if close && let Err(e) = sender.close().await {
-                error!("error closing socket: {e}");
-            }
 
             if let Err(e) = err {
                 error!("{}", e);
             }
+
+            if close {
+                if let Err(e) = sender.close().await {
+                    error!("error closing socket: {e}");
+                }
+                break;
+            }
         }
+        info!("exited message passer task");
     });
 
     {
@@ -143,7 +155,7 @@ async fn write(sender: mpsc::Sender<WSMessagePass>, peer_id: i64, state: AppStat
                         continue;
                     }
                 }
-                ResponseType::Error(_) => continue,
+                ResponseType::Error { .. } => continue,
             };
 
             if let Err(e) = sender.send(WSMessagePass::Typed(msg)).await {
@@ -160,8 +172,8 @@ async fn read(
     state: AppStateWrapped,
 ) {
     while let Some(msg) = receiver.next().await {
-        let span=span!(Level::TRACE, "request");
-        let _enter=span.enter();
+        let span = span!(Level::TRACE, "request");
+        let _enter = span.enter();
 
         info!("new ws message:{:#?}", msg);
 
@@ -223,27 +235,47 @@ async fn read(
                     None => create_lobby(true, state.clone()).await,
                 };
 
-                if let Err(e) = join_lobby(peer_id, lobby_id.clone(), state.clone()).await
+                info!("lobby id: {lobby_id}");
+
+                if let Err(e) = join_lobby(peer_id, lobby_id.clone(), state.clone()).await {
+                    let e = format!("error joining lobby: {e}");
+
+                    error!(e);
+
+                    if let Err(e) = sender
+                        .send(WSMessagePass::Typed(ResponseType::Error { error: e }))
+                        .await
+                    {
+                        error!("error sending error: {}", e);
+                    }
+                }
+
+                let mesh = state.lock().await.lobbies.get(&lobby_id).map(|l| l.mesh);
+                if let Some(mesh) = mesh
                     && let Err(e) = sender
-                        .send(WSMessagePass::Typed(ResponseType::Error(format!(
-                            "error joining lobby: {e}"
-                        ))))
+                        .send(WSMessagePass::Typed(ResponseType::ID {
+                            id: peer_id,
+                            lobby_id: lobby_id.clone(),
+                            mesh,
+                        }))
                         .await
                 {
-                    error!("error sending error: {}", e);
+                    error!("sending message to message passer through channel: {e}");
                 }
-                
+
                 info!("joined lobby: {lobby_id}");
             }
             RequestType::Relay { dest_id, message } => {
-                if let Err(e) = relay_message(peer_id, dest_id, message, state.clone()).await
-                    && let Err(e) = sender
-                        .send(WSMessagePass::Typed(ResponseType::Error(format!(
-                            "error relaying message: {e}"
-                        ))))
+                if let Err(e) = relay_message(peer_id, dest_id, message, state.clone()).await {
+                    let e = format!("error relaying message: {e}");
+                    error!(e);
+
+                    if let Err(e) = sender
+                        .send(WSMessagePass::Typed(ResponseType::Error { error: e }))
                         .await
-                {
-                    error!("error relaying message: {}", e);
+                    {
+                        error!("sending message to message passer through channel: {e}");
+                    }
                 }
             }
         };
@@ -332,19 +364,14 @@ async fn join_lobby(peer_id: i64, lobby_id: String, state: AppStateWrapped) -> R
 
     lobby.peers.push(peer_id);
 
-    lobby
+    info!("channel count: {}", lobby.channel.strong_count());
+
+    let e = lobby
         .channel
         .send(ResponseType::PeerConnect { id: peer_id })
-        .map_err(Error::ChannelSendError)?;
+        .map_err(Error::ChannelSendError);
 
-    lobby
-        .channel
-        .send(ResponseType::ID {
-            id: peer_id,
-            lobby_id: lobby_id.clone(),
-            mesh: lobby.mesh,
-        })
-        .map_err(Error::ChannelSendError)?;
-
+    info!("after channel count: {}", lobby.channel.strong_count());
+    e?;
     Ok(())
 }
