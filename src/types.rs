@@ -111,7 +111,7 @@ pub enum ResponseType {
 #[serde(tag = "type",rename_all = "snake_case", rename_all_fields = "snake_case")]
 pub enum RelayMessage {
     Offer{offer: String},
-    Answer{offer: String},
+    Answer{answer: String},
     Candidate {
         mid: String,
         index: String,
