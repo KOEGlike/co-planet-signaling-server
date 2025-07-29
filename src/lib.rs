@@ -265,17 +265,6 @@ async fn read(
                 let lobby = state.lobbies.get(&lobby_id);
 
                 if let Some(lobby) = lobby {
-                    for p in &lobby.peers {
-                        if *p != peer_id {
-                            if let Err(e) = sender
-                                .send(WSMessagePass::Typed(ResponseType::PeerConnect { id: *p }))
-                                .await
-                            {
-                                error!("sending message to message passer through channel: {e}");
-                            }
-                        }
-                    }
-
                     if let Err(e) = sender
                         .send(WSMessagePass::Typed(ResponseType::Id {
                             id: peer_id,
@@ -285,6 +274,17 @@ async fn read(
                         .await
                     {
                         error!("sending message to message passer through channel: {e}");
+                    }
+
+                    for p in &lobby.peers {
+                        if *p != peer_id {
+                            if let Err(e) = sender
+                                .send(WSMessagePass::Typed(ResponseType::PeerConnect { id: *p }))
+                                .await
+                            {
+                                error!("sending message to message passer through channel: {e}");
+                            }
+                        }
                     }
                 }
 

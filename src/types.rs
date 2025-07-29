@@ -108,10 +108,10 @@ pub enum ResponseType {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type")]
+#[serde(tag = "type",rename_all = "snake_case", rename_all_fields = "snake_case")]
 pub enum RelayMessage {
-    Offer(String),
-    Answer(String),
+    Offer{offer: String},
+    Answer{offer: String},
     Candidate {
         mid: String,
         index: String,
