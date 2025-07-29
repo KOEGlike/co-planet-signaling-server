@@ -79,16 +79,16 @@ pub struct AppState {
 pub type AppStateWrapped = Arc<Mutex<AppState>>;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type")]
+#[serde(tag = "type",rename_all = "snake_case", rename_all_fields = "snake_case")]
 pub enum RequestType {
     Join { lobby_id: Option<String> },
     Relay { dest_id: i64, message: RelayMessage },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type")]
+#[serde(tag = "type",rename_all = "snake_case", rename_all_fields = "snake_case")]
 pub enum ResponseType {
-    ID {
+    Id {
         id: i64,
         lobby_id: String,
         mesh: bool,

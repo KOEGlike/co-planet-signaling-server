@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if)]
+
 use std::time::Duration;
 
 use axum::{
@@ -15,7 +17,7 @@ use tokio::{
     sync::{broadcast, mpsc},
     time::sleep,
 };
-use tracing::{field::ValueSet, *};
+use tracing::*;
 
 pub mod types;
 pub use types::*;
@@ -106,18 +108,27 @@ async fn handle_socket(socket: WebSocket, state: AppStateWrapped) {
 
 async fn write(sender: mpsc::Sender<WSMessagePass>, peer_id: i64, state: AppStateWrapped) {
     loop {
-        let mut state = state.lock().await;
-        let l = if let Some(p) = state.peers.get(&peer_id).cloned()
-            && let Some(l_id) = p.lobby
-            && let Some(l) = state.lobbies.get_mut(&l_id)
-        {
-            l
-        } else {
-            sleep(Duration::from_millis(500)).await;
-            continue;
+        let channel_receiver = {
+            let mut state = state.lock().await;
+
+            if let Some(p) = state.peers.get(&peer_id)
+                && let Some(l_id) = p.lobby.clone()
+                && let Some(lobby) = state.lobbies.get_mut(&l_id)
+            {
+                let channel = lobby.channel.subscribe();
+                Some((l_id, channel))
+            } else {
+                None
+            }
         };
 
-        let mut channel = l.channel.subscribe();
+        let (lobby_id, mut channel) = match channel_receiver {
+            Some(ch) => ch,
+            None => {
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
 
         loop {
             let msg = channel.recv().await;
@@ -125,18 +136,18 @@ async fn write(sender: mpsc::Sender<WSMessagePass>, peer_id: i64, state: AppStat
             let msg = match msg {
                 Ok(m) => m,
                 Err(broadcast::error::RecvError::Closed) => {
-                    error!("channel closed for lobby {}", l.id);
+                    error!("channel closed for lobby {}", lobby_id);
                     sleep(Duration::from_millis(500)).await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(lag)) => {
-                    warn!("lobby {} lagged {lag} messages", l.id);
+                    warn!("lobby {} lagged {lag} messages", lobby_id);
                     continue;
                 }
             };
 
             let msg = match msg {
-                ResponseType::ID { .. } => continue,
+                ResponseType::Id { .. } => continue,
                 ResponseType::PeerConnect { id } | ResponseType::PeerDisconnect { id } => {
                     if id != peer_id {
                         msg
@@ -250,17 +261,31 @@ async fn read(
                     }
                 }
 
-                let mesh = state.lock().await.lobbies.get(&lobby_id).map(|l| l.mesh);
-                if let Some(mesh) = mesh
-                    && let Err(e) = sender
-                        .send(WSMessagePass::Typed(ResponseType::ID {
+                let state = state.lock().await;
+                let lobby = state.lobbies.get(&lobby_id);
+
+                if let Some(lobby) = lobby {
+                    for p in &lobby.peers {
+                        if *p != peer_id {
+                            if let Err(e) = sender
+                                .send(WSMessagePass::Typed(ResponseType::PeerConnect { id: *p }))
+                                .await
+                            {
+                                error!("sending message to message passer through channel: {e}");
+                            }
+                        }
+                    }
+
+                    if let Err(e) = sender
+                        .send(WSMessagePass::Typed(ResponseType::Id {
                             id: peer_id,
                             lobby_id: lobby_id.clone(),
-                            mesh,
+                            mesh: lobby.mesh,
                         }))
                         .await
-                {
-                    error!("sending message to message passer through channel: {e}");
+                    {
+                        error!("sending message to message passer through channel: {e}");
+                    }
                 }
 
                 info!("joined lobby: {lobby_id}");
