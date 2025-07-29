@@ -116,13 +116,13 @@ async fn write(sender: mpsc::Sender<WSMessagePass>, peer_id: i64, state: AppStat
                 && let Some(lobby) = state.lobbies.get_mut(&l_id)
             {
                 let channel = lobby.channel.subscribe();
-                Some((l_id, channel))
+                Some((l_id, lobby.host, channel))
             } else {
                 None
             }
         };
 
-        let (lobby_id, mut channel) = match channel_receiver {
+        let (lobby_id, host, mut channel) = match channel_receiver {
             Some(ch) => ch,
             None => {
                 sleep(Duration::from_millis(500)).await;
@@ -148,9 +148,18 @@ async fn write(sender: mpsc::Sender<WSMessagePass>, peer_id: i64, state: AppStat
 
             let msg = match msg {
                 ResponseType::Id { .. } => continue,
-                ResponseType::PeerConnect { id } | ResponseType::PeerDisconnect { id } => {
+                ResponseType::PeerConnect { id } => {
                     if id != peer_id {
-                        msg
+                        let id = if id == host { 1 } else { id };
+                        ResponseType::PeerConnect { id }
+                    } else {
+                        continue;
+                    }
+                }
+                ResponseType::PeerDisconnect { id } => {
+                    if id != peer_id {
+                        let id = if id == host { 1 } else { id };
+                        ResponseType::PeerDisconnect { id }
                     } else {
                         continue;
                     }
@@ -243,7 +252,7 @@ async fn read(
             RequestType::Join { lobby_id } => {
                 let lobby_id = match lobby_id {
                     Some(lobby_id) => lobby_id,
-                    None => create_lobby(true, state.clone()).await,
+                    None => create_lobby(peer_id, true, state.clone()).await,
                 };
 
                 info!("lobby id: {lobby_id}");
@@ -267,7 +276,7 @@ async fn read(
                 if let Some(lobby) = lobby {
                     if let Err(e) = sender
                         .send(WSMessagePass::Typed(ResponseType::Id {
-                            id: peer_id,
+                            id: { if lobby.host == peer_id { 1 } else { peer_id } },
                             lobby_id: lobby_id.clone(),
                             mesh: lobby.mesh,
                         }))
@@ -279,7 +288,9 @@ async fn read(
                     for p in &lobby.peers {
                         if *p != peer_id {
                             if let Err(e) = sender
-                                .send(WSMessagePass::Typed(ResponseType::PeerConnect { id: *p }))
+                                .send(WSMessagePass::Typed(ResponseType::PeerConnect {
+                                    id: if *p == lobby.host { 1 } else { *p },
+                                }))
                                 .await
                             {
                                 error!("sending message to message passer through channel: {e}");
@@ -307,12 +318,12 @@ async fn read(
     }
 }
 
-async fn create_lobby(mesh: bool, state: AppStateWrapped) -> String {
+async fn create_lobby(host: i64, mesh: bool, state: AppStateWrapped) -> String {
     let mut state = state.lock().await;
 
     let id = cuid2::CuidConstructor::new().with_length(8).create_id();
 
-    let lobby = Lobby::new(id.clone(), mesh, vec![]);
+    let lobby = Lobby::new(id.clone(), host, mesh, vec![]);
 
     state.lobbies.insert(id.clone(), lobby);
 
@@ -327,14 +338,6 @@ async fn relay_message(
 ) -> Result<(), Error> {
     let mut state = state.lock().await;
 
-    let dest_lobby = match state.peers.get(&dest_id) {
-        Some(p) => match &p.lobby {
-            Some(l) => l,
-            None => return Err(Error::NoLobby { peer_id: dest_id }),
-        },
-        None => return Err(Error::PeerDoesNotExist { id: dest_id }),
-    };
-
     let sender_lobby = match state.peers.get(&sender_id) {
         Some(p) => match &p.lobby {
             Some(l) => l,
@@ -343,14 +346,24 @@ async fn relay_message(
         None => return Err(Error::PeerDoesNotExist { id: dest_id }),
     };
 
-    if **dest_lobby != **sender_lobby {
-        return Err(Error::LobbiesDoNotMatch {
-            sender_lobby_id: (*sender_lobby).clone(),
-            dest_lobby_id: (*dest_lobby).clone(),
-        });
+    if dest_id != 1 {
+        let dest_lobby = match state.peers.get(&dest_id) {
+            Some(p) => match &p.lobby {
+                Some(l) => l,
+                None => return Err(Error::NoLobby { peer_id: dest_id }),
+            },
+            None => return Err(Error::PeerDoesNotExist { id: dest_id }),
+        };
+
+        if **dest_lobby != **sender_lobby {
+            return Err(Error::LobbiesDoNotMatch {
+                sender_lobby_id: (*sender_lobby).clone(),
+                dest_lobby_id: (*dest_lobby).clone(),
+            });
+        }
     }
 
-    let lobby_id = dest_lobby.clone();
+    let lobby_id = sender_lobby.clone();
 
     let lobby = match state.lobbies.get_mut(&lobby_id) {
         Some(l) => l,
@@ -360,6 +373,14 @@ async fn relay_message(
             });
         }
     };
+
+    let sender_id = if sender_id == lobby.host {
+        1
+    } else {
+        sender_id
+    };
+
+    let dest_id = if dest_id == 1 { lobby.host } else { dest_id };
 
     lobby
         .channel

@@ -35,6 +35,7 @@ pub struct Lobby {
     pub id: String,
     pub mesh: bool,
     pub peers: Vec<i64>,
+    pub host:i64,
     pub channel: broadcast::Sender<ResponseType>,
 }
 
@@ -58,11 +59,12 @@ impl Eq for Lobby {
 
 
 impl Lobby {
-    pub fn new(id: String, mesh: bool, peers: Vec<i64>) -> Self {
+    pub fn new(id: String, host:i64,mesh: bool, peers: Vec<i64>) -> Self {
         let (send, _) = broadcast::channel::<ResponseType>(100);
 
         Lobby {
             id,
+            host,
             mesh,
             peers,
             channel: send,
