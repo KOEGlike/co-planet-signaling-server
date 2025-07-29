@@ -114,7 +114,7 @@ pub enum RelayMessage {
     Answer{answer: String},
     Candidate {
         mid: String,
-        index: String,
+        index: i64,
         sdp: String,
     },
 }
