@@ -38,7 +38,7 @@ async fn handle_socket(socket: WebSocket, state: AppStateWrapped) {
 
     let (tx, mut rx) = mpsc::channel::<WSMessagePass>(100);
 
-    let peer_id = rand::random_range(2..i64::MAX);
+    let peer_id = rand::random_range(2..2147483647);
 
     info!("new socket connection, id:{peer_id}");
 
@@ -252,7 +252,7 @@ async fn read(
             RequestType::Join { lobby_id } => {
                 let lobby_id = match lobby_id {
                     Some(lobby_id) => lobby_id,
-                    None => create_lobby(peer_id, true, state.clone()).await,
+                    None => create_lobby(peer_id, false, state.clone()).await,
                 };
 
                 info!("lobby id: {lobby_id}");
