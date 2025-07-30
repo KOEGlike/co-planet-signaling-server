@@ -2,6 +2,9 @@
 
 use std::time::Duration;
 
+/// if to use rtc mesh
+const MESH :bool = true;
+
 use axum::{
     extract::{
         State,
@@ -32,7 +35,6 @@ enum WSMessagePass {
     Typed(ResponseType),
 }
 
-#[tracing::instrument]
 async fn handle_socket(socket: WebSocket, state: AppStateWrapped) {
     let (mut sender, receiver) = socket.split();
 
@@ -50,12 +52,9 @@ async fn handle_socket(socket: WebSocket, state: AppStateWrapped) {
         },
     );
 
-    info!("inserted peer");
-
     tokio::spawn(async move {
         let span = span!(Level::TRACE, "message passer");
         let _enter = span.enter();
-        info!("entered message passer task");
         while let Some(msg) = rx.recv().await {
             let mut close = false;
             let msg = match msg {
@@ -89,7 +88,6 @@ async fn handle_socket(socket: WebSocket, state: AppStateWrapped) {
                 break;
             }
         }
-        info!("exited message passer task");
     });
 
     {
@@ -195,7 +193,7 @@ async fn read(
         let span = span!(Level::TRACE, "request");
         let _enter = span.enter();
 
-        info!("new ws message:{:#?}", msg);
+        // info!("new ws message:{:#?}", msg);
 
         let msg = match msg {
             Ok(msg) => msg,
@@ -234,7 +232,7 @@ async fn read(
             }
         };
 
-        info!("text ws message: {msg}");
+        // info!("text ws message: {msg}");
 
         let msg = serde_json::from_str::<RequestType>(&msg);
 
@@ -246,16 +244,16 @@ async fn read(
             }
         };
 
-        info!("deserialized msg: {:#?}", msg);
+        info!("deserialized msg: {:?}", msg);
 
         match msg {
             RequestType::Join { lobby_id } => {
                 let lobby_id = match lobby_id {
                     Some(lobby_id) => lobby_id,
-                    None => create_lobby(peer_id, false, state.clone()).await,
+                    None => create_lobby(peer_id, MESH, state.clone()).await,
                 };
 
-                info!("lobby id: {lobby_id}");
+                // info!("lobby id: {lobby_id}");
 
                 if let Err(e) = join_lobby(peer_id, lobby_id.clone(), state.clone()).await {
                     let e = format!("error joining lobby: {e}");
@@ -299,7 +297,7 @@ async fn read(
                     }
                 }
 
-                info!("joined lobby: {lobby_id}");
+                info!("joined lobby: {lobby_id}, peer {peer_id}");
             }
             RequestType::Relay { dest_id, message } => {
                 if let Err(e) = relay_message(peer_id, dest_id, message, state.clone()).await {
@@ -410,14 +408,10 @@ async fn join_lobby(peer_id: i64, lobby_id: String, state: AppStateWrapped) -> R
 
     lobby.peers.push(peer_id);
 
-    info!("channel count: {}", lobby.channel.strong_count());
-
-    let e = lobby
+    lobby
         .channel
         .send(ResponseType::PeerConnect { id: peer_id })
-        .map_err(Error::ChannelSendError);
+        .map_err(Error::ChannelSendError)?;
 
-    info!("after channel count: {}", lobby.channel.strong_count());
-    e?;
     Ok(())
 }
