@@ -57,6 +57,7 @@ async fn handle_socket(socket: WebSocket, state: AppStateWrapped) {
         let _enter = span.enter();
         while let Some(msg) = rx.recv().await {
             let mut close = false;
+            info!("sent message to {peer_id}: {msg:?}");
             let msg = match msg {
                 WSMessagePass::Raw(message) => {
                     if let Message::Close(_) = message {
@@ -123,7 +124,7 @@ async fn write(sender: mpsc::Sender<WSMessagePass>, peer_id: i64, state: AppStat
         let (lobby_id, host, mut channel) = match channel_receiver {
             Some(ch) => ch,
             None => {
-                sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(1)).await;
                 continue;
             }
         };
@@ -144,6 +145,8 @@ async fn write(sender: mpsc::Sender<WSMessagePass>, peer_id: i64, state: AppStat
                 }
             };
 
+            info!("got msg from channel: {msg:?}");
+
             let msg = match msg {
                 ResponseType::Id { .. } => continue,
                 ResponseType::PeerConnect { id } => {
@@ -163,11 +166,15 @@ async fn write(sender: mpsc::Sender<WSMessagePass>, peer_id: i64, state: AppStat
                     }
                 }
                 ResponseType::Relay {
-                    sender_id: _,
+                    sender_id: s,
                     dest_id,
-                    message: _,
+                    message: ref m,
                 } => {
+                    if let RelayMessage::Answer { .. } = m {
+                        info!("got answer, peer {peer_id}, sender {s}, dest {dest_id}, message: {m:?}");
+                    }
                     if dest_id == peer_id {
+                        info!("sending relay to {peer_id}, message:{msg:?}");
                         msg
                     } else {
                         continue;
