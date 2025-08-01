@@ -2,14 +2,12 @@
 
 use std::time::Duration;
 
-/// if to use rtc mesh
-const MESH :bool = true;
-
 use axum::{
     extract::{
         State,
         ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
     },
+    http::response,
     response::Response,
 };
 use futures_util::{
@@ -27,12 +25,6 @@ pub use types::*;
 
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppStateWrapped>) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
-}
-
-#[derive(Debug, Clone)]
-enum WSMessagePass {
-    Raw(Message),
-    Typed(ResponseType),
 }
 
 async fn handle_socket(socket: WebSocket, state: AppStateWrapped) {
@@ -147,31 +139,33 @@ async fn write(sender: mpsc::Sender<WSMessagePass>, peer_id: i64, state: AppStat
 
             info!("got msg from channel: {msg:?}");
 
-            let msg = match msg {
-                ResponseType::Id { .. } => continue,
-                ResponseType::PeerConnect { id } => {
+            let msg: WSMessagePass = match msg {
+                WSMessagePass::Typed(ResponseType::Id { .. }) => continue,
+                WSMessagePass::Typed(ResponseType::PeerConnect { id }) => {
                     if id != peer_id {
                         let id = if id == host { 1 } else { id };
-                        ResponseType::PeerConnect { id }
+                        ResponseType::PeerConnect { id }.into()
                     } else {
                         continue;
                     }
                 }
-                ResponseType::PeerDisconnect { id } => {
+                WSMessagePass::Typed(ResponseType::PeerDisconnect { id }) => {
                     if id != peer_id {
                         let id = if id == host { 1 } else { id };
-                        ResponseType::PeerDisconnect { id }
+                        ResponseType::PeerDisconnect { id }.into()
                     } else {
                         continue;
                     }
                 }
-                ResponseType::Relay {
+                WSMessagePass::Typed(ResponseType::Relay {
                     sender_id: s,
                     dest_id,
                     message: ref m,
-                } => {
+                }) => {
                     if let RelayMessage::Answer { .. } = m {
-                        info!("got answer, peer {peer_id}, sender {s}, dest {dest_id}, message: {m:?}");
+                        info!(
+                            "got answer, peer {peer_id}, sender {s}, dest {dest_id}, message: {m:?}"
+                        );
                     }
                     if dest_id == peer_id {
                         info!("sending relay to {peer_id}, message:{msg:?}");
@@ -180,10 +174,11 @@ async fn write(sender: mpsc::Sender<WSMessagePass>, peer_id: i64, state: AppStat
                         continue;
                     }
                 }
-                ResponseType::Error { .. } => continue,
+                WSMessagePass::Typed(ResponseType::Error { .. }) => continue,
+                _ => msg,
             };
 
-            if let Err(e) = sender.send(WSMessagePass::Typed(msg)).await {
+            if let Err(e) = sender.send(msg).await {
                 error!("error while sending to message passer thread: {e}");
             }
         }
@@ -218,7 +213,7 @@ async fn read(
                     && let Some(lobby) = state.lobbies.get_mut(&id)
                     && let Err(e) = lobby
                         .channel
-                        .send(ResponseType::PeerDisconnect { id: peer_id })
+                        .send(ResponseType::PeerDisconnect { id: peer_id }.into())
                 {
                     error!("error sending disconnect message: {e}")
                 }
@@ -256,8 +251,8 @@ async fn read(
         match msg {
             RequestType::Join { lobby_id } => {
                 let lobby_id = match lobby_id {
-                    Some(lobby_id) => lobby_id,
-                    None => create_lobby(peer_id, MESH, state.clone()).await,
+                    LobbyId::Existing { id } => id,
+                    LobbyId::Create { mesh } => create_lobby(peer_id, mesh, state.clone()).await,
                 };
 
                 // info!("lobby id: {lobby_id}");
@@ -320,6 +315,43 @@ async fn read(
                 }
             }
         };
+    }
+
+    let mut state = state.lock().await;
+    if let Some(peer) = state.peers.get(&peer_id).cloned() {
+        state.peers.remove(&peer_id);
+
+        let lobby = if let Some(ref lobby_id) = peer.lobby
+            && let Some(lobby) = state.lobbies.get_mut(lobby_id)
+        {
+            lobby
+        } else {
+            return;
+        };
+
+        let pos = lobby.peers.iter().position(|p| *p == peer.id);
+
+        if let Some(pos) = pos {
+            lobby.peers.remove(pos);
+        }
+
+        if lobby.host == peer_id {
+            if let Err(e) = sender
+                .send(WSMessagePass::Raw(Message::Close(Some(CloseFrame {
+                    code: 1011,
+                    reason: Utf8Bytes::from_static("host disconnected"),
+                }))))
+                .await
+            {
+                error!("error sending closing message to peers: {e}s");
+            }
+
+            for p in lobby.peers.clone() {
+                state.peers.remove(&p);
+            }
+        }
+
+        
     }
 }
 
@@ -389,11 +421,14 @@ async fn relay_message(
 
     lobby
         .channel
-        .send(ResponseType::Relay {
-            sender_id,
-            dest_id,
-            message,
-        })
+        .send(
+            ResponseType::Relay {
+                sender_id,
+                dest_id,
+                message,
+            }
+            .into(),
+        )
         .map_err(Error::ChannelSendError)?;
 
     Ok(())
@@ -417,7 +452,7 @@ async fn join_lobby(peer_id: i64, lobby_id: String, state: AppStateWrapped) -> R
 
     lobby
         .channel
-        .send(ResponseType::PeerConnect { id: peer_id })
+        .send(ResponseType::PeerConnect { id: peer_id }.into())
         .map_err(Error::ChannelSendError)?;
 
     Ok(())

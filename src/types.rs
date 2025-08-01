@@ -1,3 +1,4 @@
+use axum::extract::ws::Message;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, hash::Hash, sync::Arc};
 use thiserror::Error;
@@ -19,9 +20,9 @@ pub enum Error {
         dest_lobby_id: String,
     },
     #[error("the peer with the id of {peer_id} has no lobby")]
-    NoLobby{peer_id:i64},
+    NoLobby { peer_id: i64 },
     #[error("channel error: {0}")]
-    ChannelSendError(#[from] broadcast::error::SendError<ResponseType>),
+    ChannelSendError(#[from] broadcast::error::SendError<WSMessagePass>),
 }
 
 #[derive(Clone, Debug)]
@@ -35,8 +36,8 @@ pub struct Lobby {
     pub id: String,
     pub mesh: bool,
     pub peers: Vec<i64>,
-    pub host:i64,
-    pub channel: broadcast::Sender<ResponseType>,
+    pub host: i64,
+    pub channel: broadcast::Sender<WSMessagePass>,
 }
 
 impl Hash for Lobby {
@@ -53,14 +54,11 @@ impl PartialEq for Lobby {
     }
 }
 
-impl Eq for Lobby {
-    
-}
-
+impl Eq for Lobby {}
 
 impl Lobby {
-    pub fn new(id: String, host:i64,mesh: bool, peers: Vec<i64>) -> Self {
-        let (send, _) = broadcast::channel::<ResponseType>(100);
+    pub fn new(id: String, host: i64, mesh: bool, peers: Vec<i64>) -> Self {
+        let (send, _) = broadcast::channel::<WSMessagePass>(100);
 
         Lobby {
             id,
@@ -74,21 +72,40 @@ impl Lobby {
 
 #[derive(Default, Debug, Clone)]
 pub struct AppState {
-    pub lobbies: HashMap<String,Lobby>,
-    pub peers: HashMap<i64,Peer>,
+    pub lobbies: HashMap<String, Lobby>,
+    pub peers: HashMap<i64, Peer>,
 }
 
 pub type AppStateWrapped = Arc<Mutex<AppState>>;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type",rename_all = "snake_case", rename_all_fields = "snake_case")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "snake_case"
+)]
+pub enum LobbyId {
+    Existing { id: String },
+    Create { mesh: bool },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "snake_case"
+)]
 pub enum RequestType {
-    Join { lobby_id: Option<String> },
+    Join { lobby_id: LobbyId },
     Relay { dest_id: i64, message: RelayMessage },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type",rename_all = "snake_case", rename_all_fields = "snake_case")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "snake_case"
+)]
 pub enum ResponseType {
     Id {
         id: i64,
@@ -106,17 +123,45 @@ pub enum ResponseType {
         dest_id: i64,
         message: RelayMessage,
     },
-    Error{error:String},
+    Error {
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum WSMessagePass {
+    Raw(Message),
+    Typed(ResponseType),
+}
+
+impl Into<WSMessagePass> for ResponseType {
+    fn into(self) -> WSMessagePass {
+        WSMessagePass::Typed(self)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type",rename_all = "snake_case", rename_all_fields = "snake_case")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "snake_case"
+)]
 pub enum RelayMessage {
-    Offer{offer: String},
-    Answer{answer: String},
+    Offer {
+        offer: String,
+    },
+    Answer {
+        answer: String,
+    },
     Candidate {
         mid: String,
         index: i64,
         sdp: String,
     },
+}
+
+#[derive(Debug, Clone)]
+
+pub enum ChannelCommunionMessage {
+    Close {code:u16, reason: String },
 }
