@@ -7,7 +7,6 @@ use axum::{
         State,
         ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
     },
-    http::response,
     response::Response,
 };
 use futures_util::{
