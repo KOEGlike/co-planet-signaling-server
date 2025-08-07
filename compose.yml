@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  signaling-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: co-planet-signaling-server
+    ports:
+      - "3000:3000"
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    restart: unless-stopped
